@@ -231,7 +231,7 @@ class Yamfdw(ForeignDataWrapper):
         # if there was field transformation we have to use the pipeline
         if self.pipe or transfields:
             if self.pipe: pipe.extend(self.pipe)
-            if Q: pipe.insert(0, { "$match" : Q } )
+            if Q: pipe.append( { "$match" : Q } )
             pipe.append( { "$project" : projectFields } )
             if transfields and Q:
                  # only needed if quals fields are array members, can check that TODO
@@ -248,8 +248,9 @@ class Yamfdw(ForeignDataWrapper):
         if self.debug: docCount=0
         if self.debug: log2pg('cur is returned {} with total {} so far'.format(cur,t1-t0))
         for doc in cur:
+            doc = dict([(col, dict_traverser(self.fields[col]['path'], doc)) for col in columns])
             doc.update(eqfields)
-            yield dict([(col, dict_traverser(self.fields[col]['path'], doc)) for col in columns])
+            yield doc
             if self.debug: docCount=docCount+1
 
       if self.debug: t2 = time.time()
