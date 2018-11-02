@@ -21,7 +21,7 @@ import json
 class Transform(SONManipulator):
 
     def __init__(self, columns):
-        self.columns=columns;
+        self.columns=columns
 
     def transform_outgoing(self, son, collection):
         for (key, value) in son.items():
