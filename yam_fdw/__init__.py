@@ -1,12 +1,11 @@
 ###
-### Author: Asya Kamsky
+### based on https://github.com/asya999/yam_fdw
 ###
 
 from multicorn import ForeignDataWrapper
 from multicorn.utils import log_to_postgres as log2pg
 
 from pymongo import MongoClient
-from pymongo import ASCENDING
 from dateutil.parser import parse
 from bson.objectid import ObjectId
 
@@ -14,23 +13,7 @@ from functools import partial
 
 import time
 
-from pymongo.son_manipulator import SONManipulator
 import json
-
-# currently unused
-class Transform(SONManipulator):
-
-    def __init__(self, columns):
-        self.columns=columns
-
-    def transform_outgoing(self, son, collection):
-        for (key, value) in son.items():
-          if isinstance(value, dict):
-            if "_type" in value and value["_type"] == "custom":
-              son[key] = decode_custom(value)
-            else: # make sure to recurse into sub-docs
-              son[key] = self.transform_outgoing(value, collection)
-        return son
 
 dict_traverser = partial(reduce, lambda x, y: x.get(y) if type(x) == dict else x)
 
@@ -109,7 +92,7 @@ class Yamfdw(ForeignDataWrapper):
                 else: 
                    self.pkeys.append( ((f,), self.count) )
     
-    def build_spec(self, quals, trans=True):
+    def build_spec(self, quals):
         Q = {}
 
         comp_mapper = {'=' : '$eq',
@@ -130,19 +113,15 @@ class Yamfdw(ForeignDataWrapper):
             vform = lambda val: val_formatter(val) if val is not None and val_formatter is not None else val
             if self.debug: log2pg('vform {} val_formatter: {} '.format(vform, val_formatter))
 
-            if trans and 'options' in self.fields[qual.field_name] and 'mname' in self.fields[qual.field_name]['options']:
-               mongo_field_name=self.fields[qual.field_name]['options']['mname']
-            else:
-               mongo_field_name=qual.field_name
-            if self.debug: log2pg('Qual field_name: {} operator: {} value: {}'.format(mongo_field_name, qual.operator, qual.value))
+            if self.debug: log2pg('Qual field_name: {} operator: {} value: {}'.format(qual.field_name, qual.operator, qual.value))
 
             if qual.operator in comp_mapper:
-               comp = Q.setdefault(mongo_field_name, {})
+               comp = Q.setdefault(qual.field_name, {})
                if qual.operator == '~~': 
                   comp[comp_mapper[qual.operator]] = vform(qual.value.replace('%','.*'))
                else: 
                   comp[comp_mapper[qual.operator]] = vform(qual.value)
-               Q[mongo_field_name] = comp
+               Q[qual.field_name] = comp
                if self.debug: log2pg('Qual {} comp {}'.format(qual.operator, qual.value))
             else:
                log2pg('Qual operator {} not implemented for value {}'.format(qual.operator, qual.value))
@@ -168,95 +147,76 @@ class Yamfdw(ForeignDataWrapper):
     def get_path_keys(self):
         return getattr(self, 'pkeys', [])
 
-    def execute(self, quals, columns, d={}):
+    def explain(self, quals, columns, sortkeys=None, verbose=False):
+        fields, eqfields, pipe = self.plan(quals, columns)
 
-      if self.debug: t0 = time.time()
-      ## Only request fields of interest:
-      fields = dict([(k, True) for k in columns])
+        pipe.reverse()
 
-      Q = self.build_spec(quals)
+        return [ str(op) for op in pipe ]
 
-      # optimization: if columns include field(s) with equality predicate in query, then we don't have to fetch it
-      eqfields = dict([ (q.field_name , q.value) for q in quals if q.operator == '=' ])
-      for f in eqfields: fields.pop(f)
-      # instead we will inject the exact equality expression into the result set
+    def execute(self, quals, columns, sortkeys=None):
 
-      if len(fields)==0:    # no fields need to be returned, just get counts
+        fields, eqfields, pipe = self.plan(quals, columns)
 
-        if not self.pipe:
-            docCount = self.coll.find(Q).count()
-        else:   # there's a pipe with unwind
-            arr=self.pipe[0]['$unwind']    # may not be safe assumption in the future
-            countpipe=[]
-            if Q: countpipe.append({'$match':Q})
-            # hack: everyone just gets array size, 
-            # TODO: this only works for one $unwind for now
-            countpipe.append({'$project':{'_id':0, 'arrsize': {'$size':arr}}})
-            countpipe.append({'$group':{'_id':None,'sum':{'$sum':'$arrsize'}}})
-            cur = self.coll.aggregate(countpipe, cursor={})
-            for res in cur:
-               docCount=res['sum']
-               break
+        if self.debug: t0 = time.time()
+        if self.debug: log2pg('Calling aggregate with {} stage pipe {} '.format(len(pipe),pipe))
 
-        for x in xrange(docCount):
-            if eqfields: yield eqfields
-            else: yield d
-
-        # we are done
-        if self.debug: t1 = time.time()
-
-      else:  # we have one or more fields requested, with or without pipe
-
-        if '_id' not in fields:
-            fields['_id'] = False
-
-        if self.debug: log2pg('fields: {}'.format(columns))
-        if self.debug: log2pg('fields: {}'.format(fields))
-
-        pipe = []
-        projectFields={}
-        transkeys = [k for k in self.fields.keys() if 'mname' in self.fields[k].get('options',{})]
-        transfields = set(fields.keys()) & set(transkeys)
-        if self.debug: log2pg('transfields {} fieldskeys {} transkeys {}'.format(transfields,fields.keys(),transkeys))
-        for f in fields:         # there are some fields wanted returned which must be transformed
-           if self.debug: log2pg('f {} hasoptions {} self.field[f] {}'.format(f,'options' in self.fields[f],self.fields[f]))
-           if 'options' in self.fields[f] and 'mname' in self.fields[f]['options']:
-               if self.debug: log2pg('self field {} options {}'.format(f,self.fields[f]['options']['mname']))
-               projectFields[f]='$'+self.fields[f]['options']['mname']
-           else:
-               projectFields[f]=fields[f]
-
-        if self.debug: log2pg('projectFields: {}'.format(projectFields))
-
-        # if there was field transformation we have to use the pipeline
-        if self.pipe or transfields:
-            if self.pipe: pipe.extend(self.pipe)
-            if Q: pipe.append( { "$match" : Q } )
-            pipe.append( { "$project" : projectFields } )
-            if transfields and Q:
-                 # only needed if quals fields are array members, can check that TODO
-                 postQ= self.build_spec(quals, False)
-                 if Q != postQ: pipe.append( { "$match" : postQ } )
-
-            if self.debug: log2pg('Calling aggregate with {} stage pipe {} '.format(len(pipe),pipe))
-            cur = self.coll.aggregate(pipe, cursor={})
-        else:
-            if self.debug: log2pg('Calling find')
-            cur = self.coll.find(Q, fields)
+        cur = self.coll.aggregate(pipe, cursor={})
 
         if self.debug: t1 = time.time()
         if self.debug: docCount=0
         if self.debug: log2pg('cur is returned {} with total {} so far'.format(cur,t1-t0))
-        for doc in cur:
-            doc = dict([(col, dict_traverser(self.fields[col]['path'], doc)) for col in columns])
-            doc.update(eqfields)
-            yield doc
-            if self.debug: docCount=docCount+1
 
-      if self.debug: t2 = time.time()
-      if self.debug: log2pg('Python rows {} Python_duration {} {} {}ms'.format(docCount,(t1-t0)*1000,(t2-t1)*1000,(t2-t0)*1000))
+        if len(fields) == 0:
+            for res in cur:
+                docCount=res['rows']
+                break
 
-## Local Variables: ***
-## mode:python ***
-## coding: utf-8 ***
-## End: ***
+            for x in xrange(docCount):
+                if eqfields: yield eqfields
+                else: yield {}
+        else:
+            for doc in cur:
+                doc = dict([(col, dict_traverser(self.fields[col]['path'], doc)) for col in columns])
+                doc.update(eqfields)
+                yield doc
+                if self.debug: docCount=docCount+1
+
+        if self.debug: t2 = time.time()
+        if self.debug: log2pg('Python rows {} Python_duration {} {} {}ms'.format(docCount,(t1-t0)*1000,(t2-t1)*1000,(t2-t0)*1000))
+
+    def plan(self, quals, columns):
+
+        # Base pipeline
+        pipe = []
+        if self.pipe: pipe.extend(self.pipe)
+
+        # Project (rename fields)
+        fields = dict([(k, True) for k in columns])
+        projectFields={}
+        for f in fields:
+           if 'options' in self.fields[f] and 'mname' in self.fields[f]['options']:
+               projectFields[f]='$'+self.fields[f]['options']['mname']
+           else:
+               projectFields[f]=fields[f]
+        pipe.append( { "$project" : projectFields } )
+        if self.debug: log2pg('projectFields: {}'.format(projectFields))
+
+        # Match
+        Q = self.build_spec(quals)
+        if Q: pipe.append( { "$match" : Q } )
+        if self.debug: log2pg('mathcFields: {}'.format(Q))
+
+        # optimization 1: if columns include field(s) with equality predicate in query,
+        # then we don't have to fetch it, as we add them back later
+        eqfields = dict([ (q.field_name , q.value) for q in quals if q.operator == '=' ])
+        for f in eqfields: fields.pop(f)
+
+        if len(fields) == 0:
+            # optimization 2: no fields need to be returned, just get counts
+            pipe.append( { "$count": "rows" } )
+        elif len(eqfields) > 0:
+            # remove constant fields, that get added back later
+            pipe.append( { "$project" : fields } )
+
+        return (fields, eqfields, pipe)
