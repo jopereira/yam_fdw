@@ -185,6 +185,52 @@ class Yamfdw(ForeignDataWrapper):
         if self.debug: t2 = time.time()
         if self.debug: log2pg('Python rows {} Python_duration {} {} {}ms'.format(docCount,(t1-t0)*1000,(t2-t1)*1000,(t2-t0)*1000))
 
+    def flush(self, matches):
+        if len(matches)!=0:
+            return [ {'$match': matches} ]
+        else:
+            return []
+
+    def pushDown(self, op, inmatches):
+        if len(op.keys())!=1:
+            # cannot pushdown this operation
+            return (self.flush(inmatches), {})
+        for opt in op.keys():
+            if opt == '$match':
+                outmatches = inmatches.copy()
+                outmatches.update(op['$match'])
+                return ([], outmatches)
+            elif opt == '$project':
+                outmatches = {}
+                for k in inmatches.keys():
+                    v = op['$project'].get(k,True)
+                    if v == True:
+                        outmatches[k] = inmatches[k]
+                    else:
+                        outmatches[v[1:]] = inmatches[k]
+                return ([op],outmatches)
+            elif opt == '$unwind':
+                v = op['$unwind']
+                ni = {}
+                outmatches = {}
+                for k in inmatches.keys():
+                    if k.startswith(v[1:]):
+                        ni[k] = inmatches[k]
+                    else:
+                        outmatches[k] = inmatches[k]
+                return ([op]+self.flush(ni),outmatches)
+            else:
+                # cannot pushdown through other operations
+                return (self.flush(inmatches), {})
+
+    def optimize(self, input):
+        output = []
+        matches = {}
+        for op in reversed(input):
+            ops, matches = self.pushDown(op, matches)
+            output = ops + output
+        return self.flush(matches) + output
+
     def plan(self, quals, columns):
 
         # Base pipeline
@@ -218,5 +264,8 @@ class Yamfdw(ForeignDataWrapper):
         elif len(eqfields) > 0:
             # remove constant fields, that get added back later
             pipe.append( { "$project" : fields } )
+
+        # push-down filters through user supplied pipeline
+        pipe = self.optimize(pipe)
 
         return (fields, eqfields, pipe)
