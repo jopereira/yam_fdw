@@ -216,8 +216,7 @@ class Yamfdw(ForeignDataWrapper):
                 for k in inmatches.keys():
                     if k.startswith(v[1:]):
                         ni[k] = inmatches[k]
-                    else:
-                        outmatches[k] = inmatches[k]
+                    outmatches[k] = inmatches[k]
                 return ([op]+self.flush(ni),outmatches)
             else:
                 # cannot pushdown through other operations
