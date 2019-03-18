@@ -220,7 +220,7 @@ class Yamfdw(ForeignDataWrapper):
                 return ([op]+self.flush(ni),outmatches)
             else:
                 # cannot pushdown through other operations
-                return (self.flush(inmatches), {})
+                return ([op]+self.flush(inmatches), {})
 
     def optimize(self, input):
         output = []
