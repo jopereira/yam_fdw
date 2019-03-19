@@ -244,7 +244,7 @@ class Yamfdw(ForeignDataWrapper):
                projectFields[f]='$'+self.fields[f]['options']['mname']
            else:
                projectFields[f]=fields[f]
-        pipe.append( { "$project" : projectFields } )
+        if len(projectFields)>0: pipe.append({"$project": projectFields})
         if self.debug: log2pg('projectFields: {}'.format(projectFields))
 
         # Match
