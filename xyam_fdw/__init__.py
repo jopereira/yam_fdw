@@ -218,6 +218,20 @@ class Yamfdw(ForeignDataWrapper):
                         ni[k] = inmatches[k]
                     outmatches[k] = inmatches[k]
                 return ([op]+self.flush(ni),outmatches)
+            elif opt == '$group':
+                v = op['$group']['_id']
+                if isinstance(v, basestring):
+                    v = { '_id': v }
+                else:
+                    v = { '_id.'+k: v[k] for k in v }
+                ni = {}
+                outmatches = {}
+                for k in inmatches.keys():
+                    if k in v and isinstance(v[k], basestring) and v[k][0]=='$':
+                        outmatches[v[k][1:]] = inmatches[k]
+                    else:
+                        ni[k] = inmatches[k]
+                return ([op]+self.flush(ni),outmatches)
             else:
                 # cannot pushdown through other operations
                 return ([op]+self.flush(inmatches), {})
